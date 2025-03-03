@@ -1,0 +1,1011 @@
+import discord
+from discord import app_commands
+from discord.ext import commands
+import random
+import json
+import asyncio
+from datetime import datetime, timedelta
+
+# Bot Setup
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("/"), intents=intents)
+
+# Admin user IDs
+admin_ids = {"1128658280546320426", "774259101664280576"}
+
+# Max Bet Limits
+MAX_BET_WL = 2000
+MAX_BET_DL = 0
+
+# File paths
+BALANCE_FILE = "balances.json"
+TICKET_CONFIG_FILE = "ticket_config.json"
+
+# Cooldown system
+cooldowns = {}
+COOLDOWN_TIME = 5  # 5 seconds cooldown
+
+# Dictionary to track open tickets
+active_tickets = {}
+
+# Function to check if user is on cooldown
+def is_on_cooldown(user_id):
+    if user_id in cooldowns:
+        if datetime.now() < cooldowns[user_id]:
+            return True
+    return False
+
+# Function to set cooldown for a user
+def set_cooldown(user_id):
+    cooldowns[user_id] = datetime.now() + timedelta(seconds=COOLDOWN_TIME)
+
+# Function to get remaining cooldown time in seconds
+def get_cooldown_remaining(user_id):
+    if user_id in cooldowns:
+        remaining = (cooldowns[user_id] - datetime.now()).total_seconds()
+        return max(0, round(remaining, 1))
+    return 0
+
+# Load balances from file
+def load_balances():
+    try:
+        with open(BALANCE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+# Save balances to file
+def save_balances(balances):
+    with open(BALANCE_FILE, "w") as f:
+        json.dump(balances, f, indent=4)
+
+# Load ticket config from file
+def load_ticket_config():
+    try:
+        with open(TICKET_CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"deposit": {"category": None, "message": "Please provide your deposit details."}, 
+                "withdraw": {"category": None, "message": "Please provide your withdrawal details."}}
+
+# Save ticket config to file
+def save_ticket_config(config):
+    with open(TICKET_CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+# Initialize balances and ticket config
+balances = load_balances()
+ticket_config = load_ticket_config()
+
+# Reme Number Mapping
+reme_numbers = {
+    0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9,
+    10: 1, 11: 2, 12: 3, 13: 4, 14: 5, 15: 6, 16: 7, 17: 8, 18: 9, 19: 0,
+    20: 2, 21: 3, 22: 4, 23: 5, 24: 6, 25: 7, 26: 8, 27: 9, 28: 0,
+    29: 1, 30: 3, 31: 4, 32: 5, 33: 6, 34: 7, 35: 8, 36: 9
+}
+
+# Get user's balance (initialize if missing)
+def get_balance(user_id):
+    user_id = str(user_id)
+    if user_id not in balances:
+        balances[user_id] = {"wl": 0, "total_wagered": 0}
+        save_balances(balances)
+    return balances[user_id]
+
+# Set user's balance
+def set_balance(user_id, wl, total_wagered):
+    balances[str(user_id)] = {"wl": wl, "total_wagered": total_wagered}
+    save_balances(balances)
+
+# Embed Helper
+def create_embed(description: str, color=discord.Color.default()):
+    return discord.Embed(description=description, color=color)
+
+# Create close ticket button view
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        user_id = channel.name.split('-')[-1]
+        
+        # Rename the channel
+        new_name = f"closed-{channel.name}"
+        await channel.edit(name=new_name)
+        
+        # Remove the user from active tickets
+        if user_id in active_tickets:
+            active_tickets.pop(user_id)
+        
+        # Send confirmation
+        await interaction.response.send_message("Ticket closed.")
+        
+        # Create delete button
+        delete_view = TicketDeleteView()
+        await channel.send("This ticket has been closed.", view=delete_view)
+
+# Create delete ticket button view
+class TicketDeleteView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, custom_id="delete_ticket")
+    async def delete_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("Deleting ticket in 5 seconds...")
+        await asyncio.sleep(5)
+        await interaction.channel.delete()
+
+@bot.tree.command(name="reme", description="Play the Reme game.")
+async def reme(interaction: discord.Interaction, amount: int, currency: str):
+    user_id = str(interaction.user.id)
+    
+    # Check if user is on cooldown
+    if is_on_cooldown(user_id) and str(user_id) not in admin_ids:
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    balance = get_balance(user_id)
+    
+    # Ensure the currency is valid
+    if currency not in ["wl"]:
+        await interaction.response.send_message(embed=create_embed(f"❌ Invalid currency! Choose 'wl'", discord.Color.red()), ephemeral=True)
+        return
+
+    # Determine max bet limit based on currency
+    max_bet = MAX_BET_WL if currency == "wl" else MAX_BET_DL
+
+    # Check if bet amount exceeds max limit or if user has enough balance
+    if amount <= 0:
+        await interaction.response.send_message(embed=create_embed(f"❌ Bet amount must be greater than 0!", discord.Color.red()), ephemeral=True)
+        return
+
+    if amount > balance.get(currency, 0):
+        await interaction.response.send_message(embed=create_embed(f"❌ Insufficient {currency.upper()} balance!", discord.Color.red()), ephemeral=True)
+        return
+
+    if amount > max_bet:
+        await interaction.response.send_message(embed=create_embed(f"❌ Maximum bet limit for {currency.upper()} is {max_bet}!", discord.Color.red()), ephemeral=True)
+        return
+    
+    if amount <= 0 or amount > balance.get(currency, 0):
+        await interaction.response.send_message(embed=create_embed(f"❌ Invalid bet amount or insufficient {currency.upper()}!", discord.Color.red()))
+        return
+    
+    embed = create_embed(f"🎰 Player spinning 🌀\n🤖 Host spinning 🌀", discord.Color.purple())
+    await interaction.response.defer()
+    message = await interaction.followup.send(embed=embed, wait=True)
+    
+    await asyncio.sleep(3)
+    
+    player_spin = random.randint(0, 36)
+    host_spin = random.randint(0, 36)
+    player_reme = reme_numbers.get(player_spin, 0)
+    host_reme = reme_numbers.get(host_spin, 0)
+    
+     # 4% of the time, ensure host has a higher Reme number
+    if random.random() < 0.04 and host_reme <= player_reme:
+        better_options = [n for n in range(37) if reme_numbers[n] > player_reme]
+        if better_options:
+            host_spin = random.choice(better_options)
+            host_reme = reme_numbers.get(host_spin, 0)
+    
+    if host_reme in [0, 19, 28]:
+        result = f"❌ Host spun {host_spin} (Reme: {host_reme}) and wins automatically!"
+        color = discord.Color.red()
+        balance[currency] -= amount
+    elif player_reme in [0, 19, 28]:
+        result = f"🎉 You spun {player_spin} (Reme: {player_reme}) and win **2x** your bet!"
+        color = discord.Color.green()
+        balance[currency] += amount * 2
+    elif player_reme == host_reme:
+        result = f"❌ Both spun {player_spin} (Reme: {player_reme}). Host wins by default!"
+        color = discord.Color.red()
+        balance[currency] -= amount
+    elif player_reme > host_reme:
+        result = f"🎉 You won {amount} {currency.upper()}!"
+        color = discord.Color.green()
+        balance[currency] += amount
+    else:
+        result = f"❌ You lost {amount} {currency.upper()}!"
+        color = discord.Color.red()
+        balance[currency] -= amount
+    
+    balance["total_wagered"] += amount
+    set_balance(user_id, balance["wl"], balance["total_wagered"])
+    
+    final_embed = create_embed(f"🎰 Player spun **{player_spin}** (Reme: **{player_reme}**)\n🤖 Host spun **{host_spin}** (Reme: **{host_reme}**)\n{result}\n💰 Your new balance: **{balance[currency]} {currency.upper()}**", color)
+    await message.edit(embed=final_embed)
+
+# Slash Command: /stats - Leaderboard
+@bot.tree.command(name="stats", description="Leaderboard of the most wagered users.")
+async def stats(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    
+    # Check if user is on cooldown
+    if is_on_cooldown(user_id) and str(user_id) not in admin_ids:
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    leaderboard = sorted(balances.items(), key=lambda x: x[1].get("total_wagered", 0), reverse=True)
+    leaderboard_text = "🏆 **Leaderboard - Most Wagered** 🏆\n\n" + "\n".join([f"{i+1}. <@{user_id}> - **{data['total_wagered']}**WL wagered" for i, (user_id, data) in enumerate(leaderboard[:10])])
+    await interaction.response.send_message(embed=create_embed(leaderboard_text, discord.Color.gold()))
+
+# Slash Command: /bal - Check balance
+@bot.tree.command(name="bal", description="Check a user's balance.")
+async def bal(interaction: discord.Interaction, user: discord.User = None):
+    user_id = str(interaction.user.id)
+    
+    # Check if user is on cooldown
+    if is_on_cooldown(user_id) and str(user_id) not in admin_ids:
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    # If no user is specified, check the balance of the command sender
+    target_user = user if user else interaction.user
+    target_id = str(target_user.id)
+    balance = get_balance(target_id)
+
+    embed = create_embed(
+        f"💰 Balance for {target_user.mention}:\n"
+        f"WL: {balance['wl']}\n"
+        f"Total Wagered: {balance['total_wagered']}",
+        discord.Color.blue()
+    )
+    
+    await interaction.response.send_message(embed=embed)
+
+# Slash Command: /addbal - Add balance (Admin only)
+@bot.tree.command(name="addbal", description="Add balance to a user (Admin only).")
+async def addbal(interaction: discord.Interaction, user: discord.User, amount: int, currency: str):
+    user_id = str(interaction.user.id)
+    
+    if user_id not in admin_ids:
+        await interaction.response.send_message("❌ You don't have permission to use this command!", ephemeral=True)
+        return
+    
+    # Admin commands can have cooldowns too, but we're checking admin status first
+    if is_on_cooldown(user_id):
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    target_id = str(user.id)
+    balance = get_balance(target_id)
+    balance[currency] += amount
+    save_balances(balances)
+    
+    await interaction.response.send_message(embed=create_embed(f"✅ Added {amount} {currency.upper()} to {user.mention}. New balance: {balance[currency]} {currency.upper()}", discord.Color.green()))
+
+# Slash Command: /removebal - Remove balance (Admin only)
+@bot.tree.command(name="removebal", description="Remove balance from a user (Admin only).")
+async def removebal(interaction: discord.Interaction, user: discord.User, amount: int, currency: str):
+    user_id = str(interaction.user.id)
+    
+    if user_id not in admin_ids:
+        await interaction.response.send_message("❌ You don't have permission to use this command!", ephemeral=True)
+        return
+    
+    # Admin commands can have cooldowns too, but we're checking admin status first
+    if is_on_cooldown(user_id):
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    target_id = str(user.id)
+    balance = get_balance(target_id)
+    if balance[currency] < amount:
+        await interaction.response.send_message(embed=create_embed(f"❌ {user.mention} doesn't have enough {currency.upper()} to remove!", discord.Color.red()))
+        return
+    
+    balance[currency] -= amount
+    save_balances(balances)
+    
+    await interaction.response.send_message(embed=create_embed(f"✅ Removed {amount} {currency.upper()} from {user.mention}. New balance: {balance[currency]} {currency.upper()}", discord.Color.orange()))
+
+# Slash Command: /clearleaderboard - Resets leaderboard (Admin Only)
+@bot.tree.command(name="clearleaderboard", description="Reset the leaderboard (Admin Only).")
+async def clear_leaderboard(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    
+    if user_id not in admin_ids:
+        await interaction.response.send_message(embed=create_embed("❌ You don't have permission to use this command!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Admin commands can have cooldowns too, but we're checking admin status first
+    if is_on_cooldown(user_id):
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+
+    for uid in balances:
+        balances[uid]["total_wagered"] = 0
+
+    save_balances(balances)
+    await interaction.response.send_message(embed=create_embed("✅ Leaderboard has been reset!", discord.Color.green()))
+
+# Slash Command: /setupdepo - Set up deposit ticket system (Admin Only)
+@bot.tree.command(name="setupdepo", description="Set up deposit ticket system (Admin Only).")
+async def setupdepo(interaction: discord.Interaction, category_id: str, message: str):
+    user_id = str(interaction.user.id)
+    
+    if user_id not in admin_ids:
+        await interaction.response.send_message(embed=create_embed("❌ You don't have permission to use this command!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Admin commands can have cooldowns too, but we're checking admin status first
+    if is_on_cooldown(user_id):
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    # Check if category exists
+    category = discord.utils.get(interaction.guild.categories, id=int(category_id))
+    if not category:
+        await interaction.response.send_message(embed=create_embed("❌ Category not found!", discord.Color.red()))
+        return
+    
+    # Update ticket config
+    ticket_config["deposit"] = {"category": category_id, "message": message}
+    save_ticket_config(ticket_config)
+    
+    await interaction.response.send_message(embed=create_embed(f"✅ Deposit ticket system set up in category {category.name}!", discord.Color.green()))
+
+# Slash Command: /setupwithdraw - Set up withdraw ticket system (Admin Only)
+@bot.tree.command(name="setupwithdraw", description="Set up withdraw ticket system (Admin Only).")
+async def setupwithdraw(interaction: discord.Interaction, category_id: str, message: str):
+    user_id = str(interaction.user.id)
+    
+    if user_id not in admin_ids:
+        await interaction.response.send_message(embed=create_embed("❌ You don't have permission to use this command!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Admin commands can have cooldowns too, but we're checking admin status first
+    if is_on_cooldown(user_id):
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    # Check if category exists
+    category = discord.utils.get(interaction.guild.categories, id=int(category_id))
+    if not category:
+        await interaction.response.send_message(embed=create_embed("❌ Category not found!", discord.Color.red()))
+        return
+    
+    # Update ticket config
+    ticket_config["withdraw"] = {"category": category_id, "message": message}
+    save_ticket_config(ticket_config)
+    
+    await interaction.response.send_message(embed=create_embed(f"✅ Withdraw ticket system set up in category {category.name}!", discord.Color.green()))
+
+# Slash Command: /deposit - Create a deposit ticket
+@bot.tree.command(name="deposit", description="Create a deposit ticket.")
+async def deposit(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    target_user_id = 1128658280546320426 # The user ID you want to give access to
+    
+    # Check if user is on cooldown
+    if is_on_cooldown(user_id) and str(user_id) not in admin_ids:
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    # Check if user already has an active ticket and verify if the channel still exists
+    if user_id in active_tickets:
+        channel = interaction.guild.get_channel(active_tickets[user_id])
+        if channel:
+            await interaction.response.send_message(embed=create_embed(f"❌ You already have an active ticket: <#{active_tickets[user_id]}>", discord.Color.red()), ephemeral=True)
+            return
+        else:
+            # If the channel doesn't exist anymore, remove it from active_tickets
+            active_tickets.pop(user_id)
+    
+    # Check if deposit ticket system is set up
+    if not ticket_config["deposit"]["category"]:
+        await interaction.response.send_message(embed=create_embed("❌ Deposit ticket system is not set up yet!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Get category
+    category = discord.utils.get(interaction.guild.categories, id=int(ticket_config["deposit"]["category"]))
+    if not category:
+        await interaction.response.send_message(embed=create_embed("❌ Ticket category not found! Please contact an admin.", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Get the target user
+    target_user = interaction.guild.get_member(target_user_id)
+    
+    # Create ticket channel with modified permissions
+    ticket_name = f"deposit-{interaction.user.name}-{user_id}"
+    channel_overwrites = {
+        interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+    }
+    
+    # Add target user to permissions if they exist in the guild
+    if target_user:
+        channel_overwrites[target_user] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+    
+    channel = await interaction.guild.create_text_channel(
+        name=ticket_name,
+        category=category,
+        overwrites=channel_overwrites
+    )
+    
+    # Track this ticket
+    active_tickets[user_id] = channel.id
+    
+    # Send welcome message
+    welcome_embed = create_embed(f"Welcome {interaction.user.mention}\n\n{ticket_config['deposit']['message']}", discord.Color.blue())
+    close_view = TicketCloseView()
+    await channel.send(embed=welcome_embed, view=close_view)
+    
+    # Send success message
+    await interaction.response.send_message(embed=create_embed(f"✅ Deposit ticket created: {channel.mention}", discord.Color.green()), ephemeral=True)
+
+# Slash Command: /withdraw - Create a withdraw ticket
+@bot.tree.command(name="withdraw", description="Create a withdraw ticket.")
+async def withdraw(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    
+    # Check if user is on cooldown
+    if is_on_cooldown(user_id) and str(user_id) not in admin_ids:
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    # Check if user already has an active ticket
+    if user_id in active_tickets:
+        await interaction.response.send_message(embed=create_embed(f"❌ You already have an active ticket: <#{active_tickets[user_id]}>", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Check if withdraw ticket system is set up
+    if not ticket_config["withdraw"]["category"]:
+        await interaction.response.send_message(embed=create_embed("❌ Withdraw ticket system is not set up yet!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Get category
+    category = discord.utils.get(interaction.guild.categories, id=int(ticket_config["withdraw"]["category"]))
+    if not category:
+        await interaction.response.send_message(embed=create_embed("❌ Ticket category not found! Please contact an admin.", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Create ticket channel
+    ticket_name = f"withdraw-{interaction.user.name}"
+    channel = await interaction.guild.create_text_channel(
+        name=ticket_name,
+        category=category,
+        overwrites={
+            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+        }
+    )
+    
+    # Track this ticket
+    active_tickets[user_id] = channel.id
+    
+    # Send welcome message
+    welcome_embed = create_embed(f"Welcome {interaction.user.mention}\n\n{ticket_config['withdraw']['message']}", discord.Color.blue())
+    close_view = TicketCloseView()
+    await channel.send(embed=welcome_embed, view=close_view)
+    
+    # Send success message
+    await interaction.response.send_message(embed=create_embed(f"✅ Withdraw ticket created: {channel.mention}", discord.Color.green()), ephemeral=True)
+
+
+# Add these commands to your bot code
+
+# Slash Command: /tip - Tip another user
+@bot.tree.command(name="tip", description="Tip WL to another user.")
+async def tip(interaction: discord.Interaction, user: discord.User, amount: int):
+    sender_id = str(interaction.user.id)
+    
+    # Check if user is on cooldown
+    if is_on_cooldown(sender_id) and str(sender_id) not in admin_ids:
+        remaining = get_cooldown_remaining(sender_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(sender_id)
+    
+    # Check if user is trying to tip themselves
+    if user.id == interaction.user.id:
+        await interaction.response.send_message(embed=create_embed("❌ You cannot tip yourself!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Check if amount is valid
+    if amount <= 0:
+        await interaction.response.send_message(embed=create_embed("❌ Tip amount must be greater than 0!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Get sender's balance
+    sender_balance = get_balance(sender_id)
+    
+    # Check if sender has enough balance
+    if sender_balance["wl"] < amount:
+        await interaction.response.send_message(embed=create_embed(f"❌ Insufficient WL balance! You have {sender_balance['wl']} WL.", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Get recipient's balance
+    recipient_id = str(user.id)
+    recipient_balance = get_balance(recipient_id)
+    
+    # Transfer WL
+    sender_balance["wl"] -= amount
+    recipient_balance["wl"] += amount
+    
+    # Save balances
+    save_balances(balances)
+    
+    # Send success message
+    await interaction.response.send_message(embed=create_embed(f"✅ You tipped {amount} WL to {user.mention}. Your new balance: {sender_balance['wl']} WL", discord.Color.green()))
+    
+    # Try to send DM to recipient
+    try:
+        recipient_dm = await user.create_dm()
+        await recipient_dm.send(embed=create_embed(f"💰 You received {amount} WL tip from {interaction.user.mention}. Your new balance: {recipient_balance['wl']} WL", discord.Color.gold()))
+    except:
+        # If DM fails, it's fine to continue without notification
+        pass
+
+# Slash Command: /wager - Add or remove wager amount (Admin only)
+@bot.tree.command(name="wager", description="Add or remove wager amount from a user (Admin only).")
+async def wager(interaction: discord.Interaction, user: discord.User, action: str, amount: int):
+    admin_id = str(interaction.user.id)
+    
+    # Check if user is an admin
+    if admin_id not in admin_ids:
+        await interaction.response.send_message(embed=create_embed("❌ You don't have permission to use this command!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Admin commands can have cooldowns too, but we're checking admin status first
+    if is_on_cooldown(admin_id):
+        remaining = get_cooldown_remaining(admin_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the admin
+    set_cooldown(admin_id)
+    
+    # Check if action is valid
+    if action.lower() not in ["add", "remove"]:
+        await interaction.response.send_message(embed=create_embed("❌ Invalid action! Use 'add' or 'remove'.", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Check if amount is valid
+    if amount <= 0:
+        await interaction.response.send_message(embed=create_embed("❌ Amount must be greater than 0!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Get target user's balance
+    target_id = str(user.id)
+    target_balance = get_balance(target_id)
+    
+    if action.lower() == "add":
+        # Add to total wagered
+        target_balance["total_wagered"] += amount
+        result_message = f"✅ Added {amount} to {user.mention}'s total wagered amount. New total: {target_balance['total_wagered']} WL"
+        color = discord.Color.green()
+    else:  # action.lower() == "remove"
+        # Check if there's enough to remove
+        if target_balance["total_wagered"] < amount:
+            await interaction.response.send_message(embed=create_embed(f"❌ {user.mention} only has {target_balance['total_wagered']} WL wagered!", discord.Color.red()), ephemeral=True)
+            return
+        
+        # Remove from total wagered
+        target_balance["total_wagered"] -= amount
+        result_message = f"✅ Removed {amount} from {user.mention}'s total wagered amount. New total: {target_balance['total_wagered']} WL"
+        color = discord.Color.orange()
+    
+    # Save balances
+    save_balances(balances)
+    
+    # Send success message
+    await interaction.response.send_message(embed=create_embed(result_message, color))
+
+# Dictionary to store active coinflip games
+active_coinflips = {}
+
+# Coinflip multiplier settings
+COINFLIP_HOUSE_EDGE = 0.03  # 3% house edge
+COINFLIP_BASE_MULTIPLIER = 1.95  # Starting multiplier (considering house edge)
+
+# Coinflip button view
+class CoinflipView(discord.ui.View):
+    def __init__(self, user_id, bet_amount):
+        super().__init__(timeout=120)  # 2 minute timeout
+        self.user_id = user_id
+        self.bet_amount = bet_amount
+        self.streak = 0
+        self.multiplier = COINFLIP_BASE_MULTIPLIER
+        self.next_multiplier = self.calculate_next_multiplier()
+        self.current_payout = round(self.bet_amount * self.multiplier, 2)
+        self.next_payout = round(self.bet_amount * self.next_multiplier, 2)
+        
+    def calculate_next_multiplier(self):
+        # Calculate next multiplier based on streak
+        return round(COINFLIP_BASE_MULTIPLIER * (2 ** self.streak), 2)
+    
+    def update_values(self):
+        # Update multiplier and payouts after a win
+        self.streak += 1
+        self.multiplier = self.next_multiplier
+        self.next_multiplier = self.calculate_next_multiplier()
+        self.current_payout = round(self.bet_amount * self.multiplier, 2)
+        self.next_payout = round(self.bet_amount * self.next_multiplier, 2)
+    
+    # This function creates a new embed with updated values
+    def get_updated_embed(self):
+        embed = discord.Embed(
+            title="🪙 Coinflip Game",
+            description=f"Betting **{self.bet_amount} WL**\nStreak: **{self.streak}**",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="Current Multiplier", value=f"**{self.multiplier}x**", inline=True)
+        embed.add_field(name="Next Multiplier", value=f"**{self.next_multiplier}x**", inline=True)
+        embed.add_field(name="Current Payout", value=f"**{self.current_payout} WL**", inline=True)
+        embed.add_field(name="Next Payout", value=f"**{self.next_payout} WL**", inline=True)
+        return embed
+    
+    @discord.ui.button(label="Heads", style=discord.ButtonStyle.primary, emoji="🧠")
+    async def heads_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if the interaction user is the game owner
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("This is not your game!", ephemeral=True)
+            return
+        
+        # 49.5% chance to win (accounting for house edge)
+        if random.random() <= 0.495:
+            # Win
+            self.update_values()
+            embed = self.get_updated_embed()
+            embed.add_field(name="Result", value="**Heads - You won!** 🎉\nChoose to continue or cash out.", inline=False)
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            # Loss
+            embed = discord.Embed(
+                title="🪙 Coinflip Game - Game Over",
+                description=f"Bet: **{self.bet_amount} WL**",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Result", value="**Tails - You lost!** 💔", inline=False)
+            self.disable_all_buttons()
+            await interaction.response.edit_message(embed=embed, view=self)
+            
+            # Remove from active games
+            if self.user_id in active_coinflips:
+                active_coinflips.pop(self.user_id)
+    
+    @discord.ui.button(label="Tails", style=discord.ButtonStyle.primary, emoji="💰")
+    async def tails_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if the interaction user is the game owner
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("This is not your game!", ephemeral=True)
+            return
+        
+        # 48.5% chance to win (accounting for house edge)
+        if random.random() <= 0.465:
+            # Win
+            self.update_values()
+            embed = self.get_updated_embed()
+            embed.add_field(name="Result", value="**Tails - You won!** 🎉\nChoose to continue or cash out.", inline=False)
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            # Loss
+            embed = discord.Embed(
+                title="🪙 Coinflip Game - Game Over",
+                description=f"Bet: **{self.bet_amount} WL**",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="Result", value="**Heads - You lost!** 💔", inline=False)
+            self.disable_all_buttons()
+            await interaction.response.edit_message(embed=embed, view=self)
+            
+            # Remove from active games
+            if self.user_id in active_coinflips:
+                active_coinflips.pop(self.user_id)
+    
+    @discord.ui.button(label="Cash Out", style=discord.ButtonStyle.success, emoji="💸")
+    async def cashout_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if the interaction user is the game owner
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("This is not your game!", ephemeral=True)
+            return
+        
+        # Only allow cash out if they've won at least once
+        if self.streak == 0:
+            await interaction.response.send_message("You need to win at least once to cash out!", ephemeral=True)
+            return
+        
+        # Cash out the winnings
+        user_id = self.user_id
+        payout = self.current_payout
+        balance = get_balance(user_id)
+        balance["wl"] += payout
+        set_balance(user_id, balance["wl"], balance["total_wagered"])
+        
+        # Update embed
+        embed = discord.Embed(
+            title="🪙 Coinflip Game - Cashed Out",
+            description=f"Bet: **{self.bet_amount} WL**\nStreak: **{self.streak}**",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Payout", value=f"**{payout} WL** ({self.multiplier}x)", inline=False)
+        embed.add_field(name="New Balance", value=f"**{balance['wl']} WL**", inline=False)
+        
+        self.disable_all_buttons()
+        await interaction.response.edit_message(embed=embed, view=self)
+        
+        # Remove from active games
+        if self.user_id in active_coinflips:
+            active_coinflips.pop(self.user_id)
+    
+    def disable_all_buttons(self):
+        for item in self.children:
+            item.disabled = True
+
+@bot.tree.command(name="coinflip", description="Play the Coinflip game.")
+async def coinflip(interaction: discord.Interaction, amount: int):
+    user_id = str(interaction.user.id)
+    
+    # Check if user is on cooldown
+    if is_on_cooldown(user_id) and str(user_id) not in admin_ids:
+        remaining = get_cooldown_remaining(user_id)
+        await interaction.response.send_message(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()), ephemeral=True)
+        return
+    
+    # Set cooldown for the user
+    set_cooldown(user_id)
+    
+    # Check if user already has an active coinflip game
+    if user_id in active_coinflips:
+        await interaction.response.send_message(embed=create_embed(f"❌ You already have an active coinflip game!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Check if bet amount is valid
+    if amount <= 0:
+        await interaction.response.send_message(embed=create_embed(f"❌ Bet amount must be greater than 0!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Get user balance
+    balance = get_balance(user_id)
+    
+    # Check if user has enough balance
+    if amount > balance["wl"]:
+        await interaction.response.send_message(embed=create_embed(f"❌ Insufficient WL balance! You have {balance['wl']} WL.", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Check if bet exceeds max bet limit
+    if amount > MAX_BET_WL:
+        await interaction.response.send_message(embed=create_embed(f"❌ Maximum bet limit for WL is {MAX_BET_WL}!", discord.Color.red()), ephemeral=True)
+        return
+    
+    # Deduct bet amount from balance
+    balance["wl"] -= amount
+    balance["total_wagered"] += amount
+    set_balance(user_id, balance["wl"], balance["total_wagered"])
+    
+    # Create coinflip game
+    view = CoinflipView(user_id, amount)
+    embed = view.get_updated_embed()
+    embed.add_field(name="Instructions", value="Choose Heads or Tails to flip the coin.\nWin to increase your multiplier, then cash out or continue playing.", inline=False)
+    
+    # Send initial game message
+    await interaction.response.send_message(embed=embed, view=view)
+    
+    # Track active game
+    active_coinflips[user_id] = True
+
+# Function to load GrowIDs from file
+def load_grow_ids():
+    """Load GrowIDs from file"""
+    try:
+        with open("grow_ids.json", "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+# Function to save GrowIDs to file
+def save_grow_ids():
+    """Save GrowIDs to file"""
+    with open("grow_ids.json", "w") as f:
+        json.dump(grow_ids, f, indent=4)
+
+
+# Global variable for deposit world
+deposit_world = "FaroonsDepo2"  # Set your default deposit world here
+
+@bot.event
+async def on_message(message):
+    # Ignore messages from bots, but allow webhooks
+    if message.author.bot and not message.webhook_id:
+        return
+    
+    # Process dot commands
+    if message.content.startswith('.'):
+        content = message.content.split()
+        command = content[0].lower()
+        
+        # .addgrowid command
+        if command == '.addgrowid' and len(content) > 1:
+            user_id = str(message.author.id)
+            grow_id = content[1]
+            
+            # Check if user is on cooldown
+            if is_on_cooldown(user_id) and str(user_id) not in admin_ids:
+                remaining = get_cooldown_remaining(user_id)
+                await message.reply(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()))
+                return
+            
+            # Set cooldown for the user
+            set_cooldown(user_id)
+            
+            # Save the GrowID
+            grow_ids[user_id] = grow_id
+            save_grow_ids()
+            
+            await message.reply(embed=create_embed(f"✅ Your GrowID has been set to: **{grow_id}**", discord.Color.green()))
+        
+        # .deposit command
+        elif command == '.deposit':
+            user_id = str(message.author.id)
+            
+            # Check if user is on cooldown
+            if is_on_cooldown(user_id) and str(user_id) not in admin_ids:
+                remaining = get_cooldown_remaining(user_id)
+                await message.reply(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()))
+                return
+            
+            # Set cooldown for the user
+            set_cooldown(user_id)
+            
+            # Create the embed for deposit instructions
+            if deposit_world == "WORLDNAME":
+                embed = create_embed("❌ Deposit world has not been set by an admin yet.", discord.Color.red())
+            else:
+                # Check if the user has set their GrowID
+                if user_id not in grow_ids:
+                    embed = create_embed("❌ You need to set your GrowID first using `.addgrowid [your_growid]`", discord.Color.red())
+                else:
+                    embed = create_embed(
+                        f"📥 **Deposit Instructions**\n\n"
+                        f"World: **{deposit_world}**\n"
+                        f"Your GrowID: **{grow_ids[user_id]}**\n\n"
+                        f"⚠️ **IMPORTANT**: Make sure the owner/admin is in the world before depositing, or your deposit won't work!",
+                        discord.Color.blue()
+                    )
+            
+            # Try to send a DM to the user
+            try:
+                await message.author.send(embed=embed)
+                await message.add_reaction('✅')  # React to indicate success
+                
+                # Also send a confirmation in the channel
+                await message.reply(embed=create_embed("✅ I've sent you deposit instructions in DM!", discord.Color.green()))
+            except:
+                # If DM fails, send in the channel
+                await message.reply(embed=embed)
+        
+        # .addbal command (admin only)
+        elif command == '.addbal' and len(content) > 2:
+            user_id = str(message.author.id)
+            
+            # Allow command if it's from an admin or a webhook
+            is_admin = user_id in admin_ids
+            is_webhook = message.webhook_id is not None
+            
+            if not (is_admin or is_webhook):
+                await message.reply(embed=create_embed("❌ You don't have permission to use this command!", discord.Color.red()))
+                return
+            
+            # Admin commands can have cooldowns too, but we're checking admin status first
+            # Skip cooldown check for webhooks
+            if not is_webhook and is_on_cooldown(user_id):
+                remaining = get_cooldown_remaining(user_id)
+                await message.reply(embed=create_embed(f"⏳ Please wait {remaining} seconds before using this command again.", discord.Color.orange()))
+                return
+            
+            # Set cooldown for the admin (not for webhooks)
+            if not is_webhook:
+                set_cooldown(user_id)
+            
+            target_grow_id = content[1]
+            
+            # Try to convert amount to int
+            try:
+                amount = int(content[2])
+                if amount <= 0:
+                    await message.reply(embed=create_embed("❌ Amount must be a positive number!", discord.Color.red()))
+                    return
+            except ValueError:
+                await message.reply(embed=create_embed("❌ Invalid amount. Please enter a number.", discord.Color.red()))
+                return
+            
+            # Find the user with this GrowID
+            target_user_id = None
+            for uid, gid in grow_ids.items():
+                if gid.lower() == target_grow_id.lower():
+                    target_user_id = uid
+                    break
+            
+            if not target_user_id:
+                await message.reply(embed=create_embed(f"❌ No user found with GrowID: **{target_grow_id}**", discord.Color.red()))
+                return
+            
+            # Add balance to the user
+            global balances
+            if target_user_id not in balances:
+                balances[target_user_id] = {"wl": 0, "dls": 0}
+            
+            balances[target_user_id]["wl"] += amount
+            save_balances()
+            
+            # Send DM to the target user
+            try:
+                target_user = await bot.fetch_user(int(target_user_id))
+                dm_embed = create_embed(f"✅ Successfully deposited **{amount} WL** to your account! New balance: **{balances[target_user_id]['wl']} WL**", discord.Color.green())
+                await target_user.send(embed=dm_embed)
+            except Exception as e:
+                # Log the error but continue
+                print(f"Failed to send DM: {e}")
+            
+            # Different response based on source (webhook or admin)
+            source = "Webhook" if is_webhook else f"Admin {message.author.display_name}"
+            await message.reply(embed=create_embed(f"✅ {source} added {amount} WL to **{target_grow_id}**. New balance: {balances[target_user_id]['wl']} WL", discord.Color.green()))
+    
+    # Don't forget this line to process slash commands if you have them
+    await bot.process_commands(message)
+
+# Persistent views setup
+@bot.event
+async def on_ready():
+    # Load GrowIDs on startup
+    global grow_ids
+    grow_ids = load_grow_ids()
+    
+    # Register views with persistent custom IDs
+    bot.add_view(TicketCloseView())
+    bot.add_view(TicketDeleteView())
+    
+    await bot.tree.sync()
+    print(f"Synced commands and logged in as {bot.user}")
+
+bot.run("")
