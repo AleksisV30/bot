@@ -5,6 +5,8 @@ import random
 import json
 import asyncio
 from datetime import datetime, timedelta
+import sqlite3
+from functools import wraps
 
 # Bot Setup
 intents = discord.Intents.default()
@@ -993,6 +995,135 @@ async def on_message(message):
     
     # Don't forget this line to process slash commands if you have them
     await bot.process_commands(message)
+
+class RewardCodeSystem(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.conn = sqlite3.connect('reward_codes.db')
+        self.create_tables()
+
+    def create_tables(self):
+        """Create necessary database tables if they don't exist"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reward_codes (
+                code TEXT PRIMARY KEY,
+                wls INTEGER,
+                max_uses INTEGER,
+                current_uses INTEGER DEFAULT 0
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS code_redemptions (
+                code TEXT,
+                user_id INTEGER,
+                redeemed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.commit()
+
+    def cog_unload(self):
+        """Close database connection when cog is unloaded"""
+        self.conn.close()
+
+    @commands.command(name='addcode')
+    @commands.has_permissions(administrator=True)
+    async def addcode(self, ctx, wls: int, max_uses: int, code: str):
+        """
+        Add a new reward code (Admin only)
+        
+        :param ctx: Command context
+        :param wls: Number of World Locks to be awarded
+        :param max_uses: Maximum number of times the code can be used
+        :param code: The unique redemption code
+        """
+        try:
+            cursor = self.conn.cursor()
+            # Check if code already exists
+            cursor.execute('SELECT * FROM reward_codes WHERE code = ?', (code,))
+            if cursor.fetchone():
+                await ctx.send(f"Error: Code {code} already exists.")
+                return
+            
+            # Insert new code
+            cursor.execute('''
+                INSERT INTO reward_codes (code, wls, max_uses, current_uses) 
+                VALUES (?, ?, ?, 0)
+            ''', (code, wls, max_uses))
+            
+            self.conn.commit()
+            await ctx.send(f"Code {code} added successfully. {wls} WLS, {max_uses} max uses.")
+        
+        except sqlite3.Error as e:
+            await ctx.send(f"Database error: {e}")
+
+    @commands.command(name='redeem')
+    async def redeem(self, ctx, code: str):
+        """
+        Redeem a reward code
+        
+        :param ctx: Command context
+        :param code: The redemption code to use
+        """
+        try:
+            cursor = self.conn.cursor()
+            user_id = ctx.author.id
+            
+            # Check code exists and has uses left
+            cursor.execute('''
+                SELECT wls, max_uses, current_uses 
+                FROM reward_codes 
+                WHERE code = ?
+            ''', (code,))
+            
+            code_info = cursor.fetchone()
+            if not code_info:
+                await ctx.send("Error: Invalid code.")
+                return
+            
+            wls, max_uses, current_uses = code_info
+            
+            # Check if code has been used too many times
+            if current_uses >= max_uses:
+                await ctx.send("Error: This code has been fully redeemed.")
+                return
+            
+            # Check if user has already redeemed this code
+            cursor.execute('''
+                SELECT * FROM code_redemptions 
+                WHERE code = ? AND user_id = ?
+            ''', (code, user_id))
+            
+            if cursor.fetchone():
+                await ctx.send("Error: You have already redeemed this code.")
+                return
+            
+            # Add redemption record
+            cursor.execute('''
+                INSERT INTO code_redemptions (code, user_id) 
+                VALUES (?, ?)
+            ''', (code, user_id))
+            
+            # Update code usage count
+            cursor.execute('''
+                UPDATE reward_codes 
+                SET current_uses = current_uses + 1 
+                WHERE code = ?
+            ''', (code,))
+            
+            self.conn.commit()
+            await ctx.send(f"Successfully redeemed {wls} World Locks!")
+        
+        except sqlite3.Error as e:
+            await ctx.send(f"Database error: {e}")
+
+async def setup(bot):
+    """
+    Setup function to add the cog to the bot
+    
+    :param bot: The Discord bot instance
+    """
+    await bot.add_cog(RewardCodeSystem(bot))
 
 # Persistent views setup
 @bot.event
